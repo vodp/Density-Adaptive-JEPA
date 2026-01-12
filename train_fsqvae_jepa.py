@@ -1272,9 +1272,17 @@ class MultiScaleDiscriminator(nn.Module):
             fg.append(fg_)
         return rs,gs,fr,fg
 
-def make_collate_fn(sample_rate, hop_length):
-    """Create a collate function that ensures minimum sequence length"""
-    def collate_fn(batch):
+class CollateWaveforms:
+    """Picklable collate function for multi-worker DataLoader.
+    
+    Classes are picklable (unlike nested functions/closures), which is required
+    when using num_workers > 0 with spawn multiprocessing.
+    """
+    def __init__(self, sample_rate: int, hop_length: int):
+        self.sample_rate = sample_rate
+        self.hop_length = hop_length
+    
+    def __call__(self, batch):
         if not batch: 
             return None
         
@@ -1284,17 +1292,20 @@ def make_collate_fn(sample_rate, hop_length):
         # Ensure minimum sequence length to prevent encoder dimension collapse
         # Rule: output_time = ceil(input_time / hop_length)
         # To get output_time >= 4, we need input_time >= 3*hop_length + 1
-        min_samples = max(int(sample_rate * 0.5), 4 * hop_length)
+        min_samples = max(int(self.sample_rate * 0.5), 4 * self.hop_length)
         T = max(T, min_samples)
         
         # Align to hop_length boundary
-        T = ((T + hop_length - 1) // hop_length) * hop_length
+        T = ((T + self.hop_length - 1) // self.hop_length) * self.hop_length
         
         # Stack and add channel dimension
         xs = torch.stack([F.pad(x, (0, T - x.shape[0])) for x in batch], dim=0)
         return xs.unsqueeze(1)  # [B, 1, T]
-    
-    return collate_fn
+
+
+def make_collate_fn(sample_rate: int, hop_length: int) -> CollateWaveforms:
+    """Create a picklable collate function for multi-worker DataLoader."""
+    return CollateWaveforms(sample_rate, hop_length)
 
 
 def worker_init_fn(worker_id: int):
