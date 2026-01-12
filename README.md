@@ -138,9 +138,9 @@ CUDA_VISIBLE_DEVICES=0,1 deepspeed --master_port=29010 train_jepa_fsqvae_hifigan
 
 ### Training Data Format
 
-#### JSONL Structure
+#### Option 1: JSONL File (Local Audio)
 
-The training script expects a JSONL file where each line contains metadata for one audio file:
+The training script accepts a JSONL file where each line contains metadata for one audio file:
 
 ```jsonl
 {"path": "/path/to/audio1.wav", "duration": 5.23, "speaker": "spk001"}
@@ -162,6 +162,32 @@ The training script expects a JSONL file where each line contains metadata for o
 - UTF-8 encoding
 - Unix-style newlines (`\n`)
 - No commas between lines
+
+#### Option 2: HuggingFace Dataset
+
+You can stream data directly from HuggingFace datasets using `--hf_dataset`:
+
+```bash
+deepspeed train_jepa_fsqvae_hifigan.py \
+  --hf_dataset aldea-ai/podcast-100k \
+  --hf_audio_field mp3 \
+  --hf_speaker_field json.speaker_id \
+  --hf_duration_field json.duration_ms \
+  --out_dir ./outputs \
+  --stage train_jepa \
+  --ds_config ds_config.json
+```
+
+**HuggingFace Arguments:**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--hf_dataset` | - | HuggingFace dataset ID (e.g., `aldea-ai/podcast-100k`) |
+| `--hf_audio_field` | `mp3` | Field name containing audio data |
+| `--hf_speaker_field` | `json.speaker_id` | Path to speaker ID (dot notation for nested) |
+| `--hf_duration_field` | `json.duration_ms` | Path to duration field |
+| `--hf_split` | `train` | Dataset split to use |
+
+**Note:** At least one of `--jsonl` or `--hf_dataset` must be provided.
 
 #### Audio File Requirements
 
@@ -186,6 +212,7 @@ with open("train_data.jsonl", "w") as f:
 ```
 
 ---
+
 
 ## Checkpoint Conversion
 

@@ -370,6 +370,132 @@ class StreamingWaveformDataset(IterableDataset):
 # FSQ Quantizer
 # ------------------------------
 
+class HuggingFaceAudioDataset(IterableDataset):
+    """Load audio from HuggingFace datasets with streaming support.
+    
+    Supports datasets like 'aldea-ai/podcast-100k' with:
+    - Audio field (e.g., 'mp3') containing audio data
+    - JSON metadata with speaker_id, duration_ms, etc.
+    """
+    def __init__(self,
+                 dataset_id: str,
+                 sample_rate: int = 24000,
+                 max_seconds: float = 10.0,
+                 rank: int = 0,
+                 world_size: int = 1,
+                 audio_field: str = "mp3",
+                 speaker_field: str = "json.speaker_id",
+                 duration_field: str = "json.duration_ms",
+                 split: str = "train",
+                 augment: bool = True):
+        super().__init__()
+        self.dataset_id = dataset_id
+        self.sample_rate = sample_rate
+        self.max_seconds = max_seconds
+        self.rank = rank
+        self.world_size = world_size
+        self.audio_field = audio_field
+        self.speaker_field = speaker_field
+        self.duration_field = duration_field
+        self.split = split
+        self.augment = augment
+    
+    def _get_nested_field(self, item: dict, field_path: str):
+        """Get a nested field value from a dict using dot notation (e.g., 'json.speaker_id')"""
+        parts = field_path.split('.')
+        value = item
+        for part in parts:
+            if isinstance(value, dict) and part in value:
+                value = value[part]
+            else:
+                return None
+        return value
+    
+    def _decode_audio(self, audio_data) -> Optional[torch.Tensor]:
+        """Decode audio from HuggingFace Audio feature to torch tensor"""
+        import io
+        try:
+            if isinstance(audio_data, dict):
+                # HuggingFace Audio format: {'array': np.array, 'sampling_rate': int}
+                # or {'path': str, 'bytes': bytes}
+                if 'array' in audio_data:
+                    wav = torch.from_numpy(audio_data['array']).float()
+                    if wav.dim() == 1:
+                        wav = wav.unsqueeze(0)
+                    orig_sr = audio_data.get('sampling_rate', self.sample_rate)
+                    if orig_sr != self.sample_rate:
+                        wav = torchaudio.functional.resample(wav, orig_sr, self.sample_rate)
+                    return wav
+                elif 'bytes' in audio_data and audio_data['bytes'] is not None:
+                    # Raw bytes - decode with torchaudio
+                    audio_bytes = audio_data['bytes']
+                    wav, sr = torchaudio.load(io.BytesIO(audio_bytes))
+                    if wav.shape[0] > 1:
+                        wav = wav.mean(0, keepdim=True)
+                    if sr != self.sample_rate:
+                        wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
+                    return wav
+                elif 'path' in audio_data and audio_data['path'] is not None:
+                    # File path
+                    wav, sr = torchaudio.load(audio_data['path'])
+                    if wav.shape[0] > 1:
+                        wav = wav.mean(0, keepdim=True)
+                    if sr != self.sample_rate:
+                        wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
+                    return wav
+            return None
+        except Exception as e:
+            print(f"Error decoding audio: {e}")
+            return None
+    
+    def _process_item(self, item: dict) -> Optional[torch.Tensor]:
+        """Process a single item from the dataset"""
+        audio_data = item.get(self.audio_field)
+        if audio_data is None:
+            return None
+        
+        wav = self._decode_audio(audio_data)
+        if wav is None:
+            return None
+        
+        # Clip to max_seconds with random start
+        if self.max_seconds:
+            max_samples = int(self.sample_rate * self.max_seconds)
+            if wav.shape[-1] > max_samples:
+                start = random.randint(0, wav.shape[-1] - max_samples)
+                wav = wav[..., start:start+max_samples]
+        
+        # Apply augmentation
+        if self.augment:
+            if random.random() < 0.3:
+                wav = wav * random.uniform(0.8, 1.2)
+            if random.random() < 0.2:
+                wav = (wav + torch.randn_like(wav) * 0.001).clamp_(-1, 1)
+        
+        return wav.squeeze(0)
+    
+    def __iter__(self):
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            raise ImportError("Please install the 'datasets' library: uv pip install datasets")
+        
+        # Load dataset with streaming
+        ds = load_dataset(self.dataset_id, split=self.split, streaming=True)
+        
+        # Iterate with rank-based sharding
+        for i, item in enumerate(ds):
+            if (i % self.world_size) != self.rank:
+                continue
+            try:
+                wav = self._process_item(item)
+                if wav is not None:
+                    yield wav
+            except Exception as e:
+                print(f"Error processing item {i}: {e}")
+                continue
+
+
 class FiniteScalarQuantizer(nn.Module):
     def __init__(self, 
                  levels: List[int], 
@@ -1117,11 +1243,30 @@ def train_jepa_encoder(args):
     rank = dist.get_rank() if is_distributed() else 0
     world = dist.get_world_size() if is_distributed() else 1
     
-    dataset = StreamingWaveformDataset(
-        root_dir=args.jsonl, sample_rate=args.sample_rate,
-        max_seconds=args.max_seconds, sleep=5.0,
-        rank=rank, world_size=world, augment=True
-    )
+    # Choose dataset based on args
+    if args.hf_dataset:
+        dataset = HuggingFaceAudioDataset(
+            dataset_id=args.hf_dataset,
+            sample_rate=args.sample_rate,
+            max_seconds=args.max_seconds,
+            rank=rank, world_size=world,
+            audio_field=args.hf_audio_field,
+            speaker_field=args.hf_speaker_field,
+            duration_field=args.hf_duration_field,
+            split=args.hf_split,
+            augment=True
+        )
+        if rank == 0:
+            print(f"[JEPA] Using HuggingFace dataset: {args.hf_dataset}")
+    else:
+        dataset = StreamingWaveformDataset(
+            root_dir=args.jsonl, sample_rate=args.sample_rate,
+            max_seconds=args.max_seconds, sleep=5.0,
+            rank=rank, world_size=world, augment=True
+        )
+        if rank == 0:
+            print(f"[JEPA] Using JSONL dataset: {args.jsonl}")
+
     
     channels = [int(x) for x in args.channels.split(',')]
     strides = [int(x) for x in args.strides.split(',')]
@@ -1351,11 +1496,30 @@ def train_decoder_with_frozen_encoder(args):
     rank = dist.get_rank() if is_distributed() else 0
     world = dist.get_world_size() if is_distributed() else 1
     
-    dataset = StreamingWaveformDataset(
-        root_dir=args.jsonl, sample_rate=args.sample_rate,
-        max_seconds=args.max_seconds, sleep=5.0,
-        rank=rank, world_size=world, augment=True
-    )
+    # Choose dataset based on args
+    if args.hf_dataset:
+        dataset = HuggingFaceAudioDataset(
+            dataset_id=args.hf_dataset,
+            sample_rate=args.sample_rate,
+            max_seconds=args.max_seconds,
+            rank=rank, world_size=world,
+            audio_field=args.hf_audio_field,
+            speaker_field=args.hf_speaker_field,
+            duration_field=args.hf_duration_field,
+            split=args.hf_split,
+            augment=True
+        )
+        if rank == 0:
+            print(f"[Stage 2] Using HuggingFace dataset: {args.hf_dataset}")
+    else:
+        dataset = StreamingWaveformDataset(
+            root_dir=args.jsonl, sample_rate=args.sample_rate,
+            max_seconds=args.max_seconds, sleep=5.0,
+            rank=rank, world_size=world, augment=True
+        )
+        if rank == 0:
+            print(f"[Stage 2] Using JSONL dataset: {args.jsonl}")
+
     
     hop = math.prod(strides)
     
@@ -1737,7 +1901,20 @@ def train_decoder_with_frozen_encoder(args):
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--jsonl', type=str, required=True)
+    # Data sources (at least one required)
+    ap.add_argument('--jsonl', type=str, default=None,
+                    help='Path to JSONL file with audio paths')
+    ap.add_argument('--hf_dataset', type=str, default=None,
+                    help='HuggingFace dataset ID (e.g., aldea-ai/podcast-100k)')
+    ap.add_argument('--hf_audio_field', type=str, default='mp3',
+                    help='Field name for audio in HuggingFace dataset')
+    ap.add_argument('--hf_speaker_field', type=str, default='json.speaker_id',
+                    help='Path to speaker ID field (dot notation for nested)')
+    ap.add_argument('--hf_duration_field', type=str, default='json.duration_ms',
+                    help='Path to duration field (dot notation for nested)')
+    ap.add_argument('--hf_split', type=str, default='train',
+                    help='Dataset split to use (default: train)')
+    
     ap.add_argument('--out_dir', type=str, required=True)
     ap.add_argument('--stage', type=str, required=True,
                     choices=['train_jepa', 'train_decoder'])
@@ -1778,7 +1955,15 @@ def parse_args():
     # DeepSpeed
     ap.add_argument('--ds_config', type=str, required=True)
     ap.add_argument('--local_rank', type=int, default=-1)
-    return ap.parse_args()
+    
+    args = ap.parse_args()
+    
+    # Validate: at least one data source required
+    if args.jsonl is None and args.hf_dataset is None:
+        ap.error("At least one of --jsonl or --hf_dataset must be provided")
+    
+    return args
+
 
 def main():
     args = parse_args()
