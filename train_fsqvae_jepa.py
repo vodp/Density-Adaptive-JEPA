@@ -3,7 +3,7 @@
 # Stage 1: JEPA self-supervised encoder training
 # Stage 2: Frozen encoder + FSQ-VAE + HiFi-GAN decoder training
 
-import os, json, argparse, random, math, time
+import os, json, argparse, random, math, time, multiprocessing
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
 from collections import deque
@@ -20,6 +20,14 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 import soundfile
 import deepspeed
+
+# Weights & Biases for experiment tracking
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
 
 # ------------------------------
 # Utilities
@@ -129,6 +137,42 @@ def load_mono_resample(path, target_sr=24000, clean: str | bool = False):
 def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
     return p
+
+def init_wandb(args, stage_name: str):
+    """Initialize Weights & Biases for experiment tracking (rank 0 only)."""
+    if not args.use_wandb:
+        return None
+    
+    if not WANDB_AVAILABLE:
+        if rank0():
+            print("[WARN] wandb is not installed. Install with: pip install wandb")
+        return None
+    
+    if not rank0():
+        return None
+    
+    # Build config dict from args
+    config = vars(args).copy()
+    # Remove non-serializable items
+    config.pop('local_rank', None)
+    
+    run_name = args.wandb_run_name or f"{args.stage}-{Path(args.out_dir).name}"
+    
+    run = wandb.init(
+        project=args.wandb_project,
+        name=run_name,
+        config=config,
+        resume="allow" if args.resume else None,
+        tags=[stage_name, f"sr_{args.sample_rate}"],
+    )
+    
+    print(f"[WANDB] Initialized run: {run.name} ({run.id})")
+    return run
+
+def log_wandb(metrics: dict, step: int):
+    """Log metrics to wandb if available and on rank 0."""
+    if WANDB_AVAILABLE and wandb.run is not None and rank0():
+        wandb.log(metrics, step=step)
 
 # ------------------------------
 # JEPA Masking Strategy
@@ -341,9 +385,29 @@ class StreamingWaveformDataset(IterableDataset):
         return wav.squeeze(0)
 
     def _file_iter(self, fpath: str):
+        """Iterate over lines in a JSONL file with proper multi-worker sharding.
+        
+        Sharding is done at two levels:
+        1. Distributed rank (across GPUs)
+        2. DataLoader worker (within each GPU)
+        """
+        # Get worker info for multi-worker DataLoader
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            # Multi-worker: compute effective global index
+            num_workers = worker_info.num_workers
+            worker_id = worker_info.id
+            # Effective world = distributed_world * num_workers
+            effective_world = self.world_size * num_workers
+            effective_rank = self.rank * num_workers + worker_id
+        else:
+            # Single worker
+            effective_world = self.world_size
+            effective_rank = self.rank
+        
         with open(fpath, "r", encoding="utf-8") as f:
             for i, line in enumerate(f):
-                if (i % self.world_size) != self.rank:
+                if (i % effective_world) != effective_rank:
                     continue
                 line = line.strip()
                 if not line: continue
@@ -498,12 +562,26 @@ class HuggingFaceAudioDataset(IterableDataset):
         except ImportError:
             raise ImportError("Please install the 'datasets' library: uv pip install datasets")
         
+        # Get worker info for multi-worker DataLoader
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            # Multi-worker: compute effective global index
+            num_workers = worker_info.num_workers
+            worker_id = worker_info.id
+            # Effective world = distributed_world * num_workers
+            effective_world = self.world_size * num_workers
+            effective_rank = self.rank * num_workers + worker_id
+        else:
+            # Single worker
+            effective_world = self.world_size
+            effective_rank = self.rank
+        
         # Load dataset with streaming
         ds = load_dataset(self.dataset_id, split=self.split, streaming=True)
         
-        # Iterate with rank-based sharding
+        # Iterate with combined rank+worker sharding
         for i, item in enumerate(ds):
-            if (i % self.world_size) != self.rank:
+            if (i % effective_world) != effective_rank:
                 continue
             try:
                 wav = self._process_item(item)
@@ -1218,6 +1296,21 @@ def make_collate_fn(sample_rate, hop_length):
     
     return collate_fn
 
+
+def worker_init_fn(worker_id: int):
+    """Initialize each DataLoader worker with unique random seed and worker info.
+    
+    For IterableDataset, each worker needs to know its ID to properly shard data.
+    This is accessed via torch.utils.data.get_worker_info() inside the dataset.
+    """
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is not None:
+        # Set unique random seed per worker to avoid duplicate augmentations
+        seed = worker_info.seed % (2**32)
+        random.seed(seed)
+        np.random.seed(seed % (2**32 - 1))
+        torch.manual_seed(seed)
+
 def feature_loss(fmap_r, fmap_g):
     loss = 0
     for dr,dg in zip(fmap_r,fmap_g):
@@ -1242,21 +1335,42 @@ def generator_loss(dg_list):
 # Training
 # ------------------------------
 
-def build_engine(model: nn.Module, optimizer, ds_config, args):
+def build_engine(model: nn.Module, ds_config, args, model_parameters=None):
+    """Build DeepSpeed engine with optimizer defined in ds_config.json.
+    
+    Args:
+        model: The model to wrap
+        ds_config: Path to ds_config.json or dict
+        args: CLI arguments
+        model_parameters: Parameters to optimize (default: all model.parameters())
+                         Can be a list of params or list of param groups
+    """
     if isinstance(ds_config, str):
         with open(ds_config, "r") as f:
             ds_config = json.load(f)
     if torch.cuda.is_available() and args.local_rank is not None and args.local_rank >= 0:
         torch.cuda.set_device(args.local_rank)
+    
+    # If model_parameters not specified, use all trainable params
+    if model_parameters is None:
+        model_parameters = [p for p in model.parameters() if p.requires_grad]
+    
+    # Let DeepSpeed create optimizer from ds_config
     engine, optimizer, _, scheduler = deepspeed.initialize(
-        args=args, model=model, optimizer=optimizer,
-        model_parameters=model.parameters(), config=ds_config
+        args=args, 
+        model=model, 
+        optimizer=None,  # DeepSpeed creates optimizer from config
+        model_parameters=model_parameters, 
+        config=ds_config
     )
     return engine, scheduler
 
 def train_jepa_encoder(args):
     """Stage 1: PURE JEPA - No artificial regularization"""
     ensure_dir(args.out_dir)
+    
+    # Initialize wandb for experiment tracking
+    wandb_run = init_wandb(args, stage_name="jepa_encoder")
     
     rank = dist.get_rank() if is_distributed() else 0
     world = dist.get_world_size() if is_distributed() else 1
@@ -1292,8 +1406,21 @@ def train_jepa_encoder(args):
     
     collate_fn = make_collate_fn(args.sample_rate, hop)
     
-    dl = DataLoader(dataset, batch_size=args.batch_size, num_workers=0,
-                    pin_memory=True, collate_fn=collate_fn)
+    # Optimized DataLoader with multi-worker prefetching
+    use_persistent = args.num_workers > 0
+    dl = DataLoader(
+        dataset, 
+        batch_size=args.batch_size, 
+        num_workers=args.num_workers,
+        pin_memory=True, 
+        collate_fn=collate_fn,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        persistent_workers=use_persistent,
+        worker_init_fn=worker_init_fn if args.num_workers > 0 else None
+    )
+    
+    if rank == 0:
+        print(f"[DataLoader] num_workers={args.num_workers}, prefetch_factor={args.prefetch_factor}, persistent={use_persistent}")
     
     model = JEPAEncoder(
         sample_rate=args.sample_rate,
@@ -1322,18 +1449,17 @@ def train_jepa_encoder(args):
         if n.startswith('target_encoder.'):
             p.requires_grad = False
     
-    opt = torch.optim.AdamW(
-        online_params, lr=args.lr, weight_decay=1e-3, betas=(0.8, 0.99)
-    )
-    
     if rank0():
         params = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in online_params)
         print(f"[JEPA Stage 1] Encoder Parameters: {params/1e6:.1f}M")
+        print(f"[JEPA Stage 1] Trainable (online encoder): {trainable/1e6:.1f}M")
         print(f"[JEPA Stage 1] Hop length (total stride): {hop}")
-        print(f"[JEPA Stage 1] Training PURE JEPA (target encoder lr=0)")
+        print(f"[JEPA Stage 1] Training PURE JEPA (target encoder frozen)")
+        print(f"[JEPA Stage 1] Optimizer configured in ds_config.json")
         print(f"Training for {args.max_steps} steps")
     
-    engine, _ = build_engine(model, opt, args.ds_config, args)
+    engine, _ = build_engine(model, args.ds_config, args, model_parameters=online_params)
     device = engine.device
     model_dtype = next(engine.module.parameters()).dtype
     
@@ -1476,6 +1602,18 @@ def train_jepa_encoder(args):
                 
                 with open(os.path.join(args.out_dir, 'jepa_logs.txt'), 'a') as f:
                     f.write(f"{global_step}\t{avg_loss:.6f}\t{mean_std:.6f}\t{min_std:.6f}\n")
+                
+                # Log to wandb
+                log_wandb({
+                    "jepa/loss": avg_loss,
+                    "jepa/loss_step": float(total_loss.detach().item()),
+                    "jepa/std_mean": mean_std,
+                    "jepa/std_min": min_std,
+                    "jepa/mask_ratio": num_masked / (B * T_z) if B * T_z > 0 else 0,
+                    "jepa/seq_len": T_z,
+                    "jepa/batch_size": B,
+                    "train/learning_rate": engine.get_lr()[0] if hasattr(engine, 'get_lr') else args.lr,
+                }, step=global_step)
             
             # Save checkpoint with global_step
             if args.save_every_steps > 0 and (global_step % args.save_every_steps == 0):
@@ -1496,10 +1634,17 @@ def train_jepa_encoder(args):
     engine.save_checkpoint(ckpt_dir, tag="final", client_state=client_sd)
     if rank0():
         print(f"[JEPA] Training complete after {global_step} steps.")
+    
+    # Finish wandb run
+    if WANDB_AVAILABLE and wandb.run is not None and rank0():
+        wandb.finish()
 
 def train_decoder_with_frozen_encoder(args):
     """Stage 2: Train FSQ + Decoder with frozen JEPA encoder"""
     ensure_dir(args.out_dir)
+    
+    # Initialize wandb for experiment tracking
+    wandb_run = init_wandb(args, stage_name="decoder")
     
     mr_stft = MRSTFTLoss(
         fft_sizes=[2048, 1024, 512, 256, 128],
@@ -1544,8 +1689,21 @@ def train_decoder_with_frozen_encoder(args):
     # Create the collate function with proper arguments
     collate_fn = make_collate_fn(args.sample_rate, hop)
     
-    dl = DataLoader(dataset, batch_size=args.batch_size, num_workers=0,
-                    pin_memory=True, collate_fn=collate_fn)
+    # Optimized DataLoader with multi-worker prefetching
+    use_persistent = args.num_workers > 0
+    dl = DataLoader(
+        dataset, 
+        batch_size=args.batch_size, 
+        num_workers=args.num_workers,
+        pin_memory=True, 
+        collate_fn=collate_fn,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        persistent_workers=use_persistent,
+        worker_init_fn=worker_init_fn if args.num_workers > 0 else None
+    )
+    
+    if rank == 0:
+        print(f"[DataLoader] num_workers={args.num_workers}, prefetch_factor={args.prefetch_factor}, persistent={use_persistent}")
     
     # Load pretrained JEPA encoder
     jepa_encoder = JEPAEncoder(
@@ -1656,16 +1814,21 @@ def train_decoder_with_frozen_encoder(args):
     msd = MultiScaleDiscriminator()
     
     # FIX 1: Separate parameter groups: encoder gets lr=0, decoder gets normal lr
+    # Freeze encoder properly via requires_grad (not lr=0 hack)
     encoder_params = list(model.encoder.parameters())
-    decoder_params = [p for n, p in model.named_parameters() if not n.startswith('encoder.')]
+    for p in encoder_params:
+        p.requires_grad = False
     
-    opt_g = torch.optim.AdamW([
-        {'params': encoder_params, 'lr': 0.0},  # Frozen via lr=0
-        {'params': decoder_params, 'lr': args.lr, 'weight_decay': 1e-3}
-    ], betas=(0.8, 0.99))
+    # Only decoder params will be optimized
+    decoder_params = [p for n, p in model.named_parameters() if p.requires_grad]
     
-    opt_d = torch.optim.AdamW(list(mpd.parameters())+list(msd.parameters()),
-                              lr=args.lr*0.5, weight_decay=1e-3, betas=(0.8,0.99))
+    # Discriminator optimizer (separate, not managed by DeepSpeed)
+    opt_d = torch.optim.AdamW(
+        list(mpd.parameters()) + list(msd.parameters()),
+        lr=2e-4,  # Discriminator LR (half of typical generator LR)
+        weight_decay=1e-3, 
+        betas=(0.8, 0.99)
+    )
     
     if rank0():
         total_params = sum(p.numel() for p in model.parameters())
@@ -1673,10 +1836,11 @@ def train_decoder_with_frozen_encoder(args):
         decoder_param_count = sum(p.numel() for p in decoder_params)
         print(f"[Stage 2] Total Parameters: {total_params/1e6:.1f}M")
         print(f"[Stage 2] Trainable (Decoder+FSQ): {decoder_param_count/1e6:.1f}M")
-        print(f"[Stage 2] Frozen via lr=0 (JEPA Encoder): {encoder_param_count/1e6:.1f}M")
+        print(f"[Stage 2] Frozen (JEPA Encoder): {encoder_param_count/1e6:.1f}M")
         print(f"[Stage 2] Hop length: {hop}, Min input samples: {4 * hop}")
+        print(f"[Stage 2] Generator optimizer from ds_config.json")
     
-    engine_g, _ = build_engine(model, opt_g, args.ds_config, args)
+    engine_g, _ = build_engine(model, args.ds_config, args, model_parameters=decoder_params)
     device = engine_g.device
     model_dtype = next(engine_g.module.parameters()).dtype
     
@@ -1845,6 +2009,19 @@ def train_decoder_with_frozen_encoder(args):
                 
                 with open(os.path.join(args.out_dir, 'decoder_logs.txt'), 'a') as f:
                     f.write(f"{global_step}\t{avg_loss:.6f}\t{avg_rec:.6f}\t{avg_stft:.6f}\t{avg_gen:.6f}\t{avg_disc:.6f}\n")
+                
+                # Log to wandb
+                log_wandb({
+                    "decoder/loss_total": avg_loss,
+                    "decoder/loss_rec": avg_rec,
+                    "decoder/loss_stft": avg_stft,
+                    "decoder/loss_gen": avg_gen,
+                    "decoder/loss_disc": avg_disc,
+                    "decoder/loss_rec_step": float(rec_loss.detach().item()),
+                    "decoder/loss_stft_step": float(stft_loss.detach().item()),
+                    "decoder/loss_gen_step": float(gen_loss.detach().item()),
+                    "train/learning_rate": engine_g.get_lr()[0] if hasattr(engine_g, 'get_lr') else args.lr,
+                }, step=global_step)
             
             # FIX 3: Inference in stage 2 with GatheredParameters
             if args.sample_every > 0 and args.sample_wav and (global_step % args.sample_every == 0):
@@ -1883,6 +2060,15 @@ def train_decoder_with_frozen_encoder(args):
                         
                         print(f"[TOK] step={global_step} G={stats['G']} fps={stats['fps']:.4f} dur={stats['seconds']:.2f}s tps={stats['tokens_per_sec']:.3f}")
                         print(f"[SYNTH] {outp}")
+                        
+                        # Log audio sample to wandb
+                        if WANDB_AVAILABLE and wandb.run is not None:
+                            wandb.log({
+                                "samples/audio": wandb.Audio(out, sample_rate=args.sample_rate, caption=f"step_{global_step}"),
+                                "samples/tokens_per_sec": stats['tokens_per_sec'],
+                                "samples/fps": stats['fps'],
+                                "samples/duration_sec": stats['seconds'],
+                            }, step=global_step)
                 except Exception as e:
                     if rank0():
                         print(f"[SYNTH ERROR] {e}")
@@ -1912,6 +2098,10 @@ def train_decoder_with_frozen_encoder(args):
                    'optimizer_d': opt_d.state_dict()},
                   os.path.join(ckpt_dir, "discriminators.pt"))
         print(f"[Stage 2] Training complete after {global_step} steps.")
+    
+    # Finish wandb run
+    if WANDB_AVAILABLE and wandb.run is not None and rank0():
+        wandb.finish()
 
 # ------------------------------
 # CLI
@@ -1966,9 +2156,22 @@ def parse_args():
     ap.add_argument('--sample_wav', type=str, default=None)
     ap.add_argument('--log_every', type=int, default=10)
     ap.add_argument('--save_every_steps', type=int, default=1000)
+    
+    # DataLoader performance tuning
+    ap.add_argument('--num_workers', type=int, default=8,
+                    help='Number of DataLoader worker processes (default: 8)')
+    ap.add_argument('--prefetch_factor', type=int, default=4,
+                    help='Number of batches to prefetch per worker (default: 4)')
 
     ap.add_argument('--reg_weight', type=float, default=1.0)
 
+    # Weights & Biases logging
+    ap.add_argument('--use_wandb', action='store_true',
+                    help='Enable Weights & Biases experiment tracking')
+    ap.add_argument('--wandb_project', type=str, default='density-adaptive-jepa',
+                    help='W&B project name')
+    ap.add_argument('--wandb_run_name', type=str, default='run1',
+                    help='W&B run name (default: auto-generated from stage and output dir)')
     
     # DeepSpeed
     ap.add_argument('--ds_config', type=str, required=True)
@@ -1984,6 +2187,13 @@ def parse_args():
 
 
 def main():
+    # Set multiprocessing start method for CUDA compatibility
+    # Must be called before any CUDA operations
+    try:
+        multiprocessing.set_start_method('spawn', force=False)
+    except RuntimeError:
+        pass  # Already set
+    
     args = parse_args()
     ensure_dir(args.out_dir)
     
