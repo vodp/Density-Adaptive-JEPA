@@ -440,6 +440,10 @@ class HuggingFaceAudioDataset(IterableDataset):
     Supports datasets like 'aldea-ai/podcast-100k' with:
     - Audio field (e.g., 'mp3') containing audio data
     - JSON metadata with speaker_id, duration_ms, etc.
+    
+    Args:
+        shuffle_buffer_size: Size of shuffle buffer for randomization (0 = no shuffle)
+        prefetch_buffer: Number of samples to prefetch ahead (0 = no prefetch)
     """
     def __init__(self,
                  dataset_id: str,
@@ -451,7 +455,9 @@ class HuggingFaceAudioDataset(IterableDataset):
                  speaker_field: str = "json.speaker_id",
                  duration_field: str = "json.duration_ms",
                  split: str = "train",
-                 augment: bool = True):
+                 augment: bool = True,
+                 shuffle_buffer_size: int = 10000,
+                 prefetch_buffer: int = 10):
         super().__init__()
         self.dataset_id = dataset_id
         self.sample_rate = sample_rate
@@ -463,6 +469,8 @@ class HuggingFaceAudioDataset(IterableDataset):
         self.duration_field = duration_field
         self.split = split
         self.augment = augment
+        self.shuffle_buffer_size = shuffle_buffer_size
+        self.prefetch_buffer = prefetch_buffer
     
     def _get_nested_field(self, item: dict, field_path: str):
         """Get a nested field value from a dict using dot notation (e.g., 'json.speaker_id')"""
@@ -578,6 +586,18 @@ class HuggingFaceAudioDataset(IterableDataset):
         
         # Load dataset with streaming
         ds = load_dataset(self.dataset_id, split=self.split, streaming=True)
+        
+        # Apply shuffle buffer for better randomization (helps with sequential storage)
+        if self.shuffle_buffer_size > 0:
+            ds = ds.shuffle(seed=42 + effective_rank, buffer_size=self.shuffle_buffer_size)
+        
+        # Apply prefetching to load data ahead of time
+        if self.prefetch_buffer > 0:
+            try:
+                ds = ds.prefetch(self.prefetch_buffer)
+            except AttributeError:
+                # prefetch not available in older datasets versions
+                pass
         
         # Iterate with combined rank+worker sharding
         for i, item in enumerate(ds):
@@ -1397,7 +1417,9 @@ def train_jepa_encoder(args):
             speaker_field=args.hf_speaker_field,
             duration_field=args.hf_duration_field,
             split=args.hf_split,
-            augment=True
+            augment=True,
+            shuffle_buffer_size=args.hf_shuffle_buffer,
+            prefetch_buffer=args.hf_prefetch_buffer
         )
         if rank == 0:
             print(f"[JEPA] Using HuggingFace dataset: {args.hf_dataset}")
@@ -1681,7 +1703,9 @@ def train_decoder_with_frozen_encoder(args):
             speaker_field=args.hf_speaker_field,
             duration_field=args.hf_duration_field,
             split=args.hf_split,
-            augment=True
+            augment=True,
+            shuffle_buffer_size=args.hf_shuffle_buffer,
+            prefetch_buffer=args.hf_prefetch_buffer
         )
         if rank == 0:
             print(f"[Stage 2] Using HuggingFace dataset: {args.hf_dataset}")
@@ -2133,6 +2157,10 @@ def parse_args():
                     help='Path to duration field (dot notation for nested)')
     ap.add_argument('--hf_split', type=str, default='train',
                     help='Dataset split to use (default: train)')
+    ap.add_argument('--hf_shuffle_buffer', type=int, default=10000,
+                    help='Shuffle buffer size for HF streaming (default: 10000, 0=disable)')
+    ap.add_argument('--hf_prefetch_buffer', type=int, default=10,
+                    help='Prefetch buffer size for HF streaming (default: 10, 0=disable)')
     
     ap.add_argument('--out_dir', type=str, required=True)
     ap.add_argument('--stage', type=str, required=True,
