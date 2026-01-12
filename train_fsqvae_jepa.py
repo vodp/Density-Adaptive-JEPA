@@ -185,7 +185,7 @@ class GaussianAdaptiveAttention(nn.Module):
         self.register_buffer("_log_sqrt_2pi", torch.tensor(0.5 * math.log(2.0 * math.pi)), persistent=False)
 
     def forward(self, x, return_attention_details: bool = False):
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             xf = x.float()
             mean_offsets = self.mean_offsets.float()
             log_sigma = self.log_sigma.float()
