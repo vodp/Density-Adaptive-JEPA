@@ -1292,21 +1292,21 @@ def train_jepa_encoder(args):
         print_model_stats(model, "JEPA Encoder (Stage 1)")
         #input("Press Enter to continue training...")  # Pause to read
 
-    # FIX 1: Set lr=0 for target encoder params
+    # Only optimize online encoder params - target encoder is EMA-updated, not gradient-updated
+    # Note: Including params with lr=0 causes DeepSpeed ZeRO to fail with empty tensor list
     online_params = [
         p for n, p in model.named_parameters() 
         if not n.startswith('target_encoder.')
     ]
     
-    target_params = [
-        p for n, p in model.named_parameters() 
-        if n.startswith('target_encoder.')
-    ]
+    # Freeze target encoder params (they're updated via EMA in update_target_encoder())
+    for n, p in model.named_parameters():
+        if n.startswith('target_encoder.'):
+            p.requires_grad = False
     
-    opt = torch.optim.AdamW([
-        {'params': online_params, 'lr': args.lr, 'weight_decay': 1e-3},
-        {'params': target_params, 'lr': 0.0, 'weight_decay': 0.0}  # lr=0 for target
-    ], betas=(0.8, 0.99))
+    opt = torch.optim.AdamW(
+        online_params, lr=args.lr, weight_decay=1e-3, betas=(0.8, 0.99)
+    )
     
     if rank0():
         params = sum(p.numel() for p in model.parameters())
