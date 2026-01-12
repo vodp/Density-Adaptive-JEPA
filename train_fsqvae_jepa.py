@@ -415,6 +415,23 @@ class HuggingFaceAudioDataset(IterableDataset):
         """Decode audio from HuggingFace Audio feature to torch tensor"""
         import io
         try:
+            # Handle new torchcodec AudioDecoder object (datasets >= 4.x)
+            # AudioDecoder.get_all_samples() returns AudioSamples with .data (torch.Tensor) and .sample_rate
+            if hasattr(audio_data, 'get_all_samples'):
+                samples = audio_data.get_all_samples()
+                wav = samples.data.float()  # Already a torch.Tensor
+                orig_sr = audio_data.metadata.sample_rate
+                
+                if wav.dim() == 1:
+                    wav = wav.unsqueeze(0)
+                if wav.shape[0] > 1:
+                    wav = wav.mean(0, keepdim=True)
+                if orig_sr != self.sample_rate:
+                    wav = torchaudio.functional.resample(wav, orig_sr, self.sample_rate)
+                return wav
+
+            
+            # Handle dict format (older datasets versions)
             if isinstance(audio_data, dict):
                 # HuggingFace Audio format: {'array': np.array, 'sampling_rate': int}
                 # or {'path': str, 'bytes': bytes}
@@ -447,6 +464,7 @@ class HuggingFaceAudioDataset(IterableDataset):
         except Exception as e:
             print(f"Error decoding audio: {e}")
             return None
+
     
     def _process_item(self, item: dict) -> Optional[torch.Tensor]:
         """Process a single item from the dataset"""
